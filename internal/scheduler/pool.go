@@ -2,17 +2,21 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
 )
 
 type workerPool struct {
-	workerCount int
-	taskChan    chan ITask
-	wg          sync.WaitGroup
-	quit        chan struct{}
-	onComplete  func(ITask)
+	life             sync.Mutex
+	started, stopped bool
+	ctx              context.Context
+	workerCount      int
+	taskChan         chan ITask
+	wg               sync.WaitGroup
+	quit             chan struct{}
+	onComplete       func(ITask)
 
 	mu             sync.RWMutex
 	workerStatuses []WorkerStats
@@ -21,6 +25,9 @@ type workerPool struct {
 }
 
 func NewWorkerPool(workerCount int) WorkerPool {
+	if workerCount < 1 {
+		workerCount = 1
+	}
 	return &workerPool{
 		workerCount:    workerCount,
 		taskChan:       make(chan ITask),
@@ -46,6 +53,15 @@ func (p *workerPool) GetCounters() (int64, int64) {
 }
 
 func (p *workerPool) Start(ctx context.Context) {
+	p.life.Lock()
+	defer p.life.Unlock()
+	if p.started || p.stopped {
+		return
+	}
+	p.started = true
+	p.ctx = ctx
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	log.Printf("Starting worker pool with %d workers", p.workerCount)
 	for i := 0; i < p.workerCount; i++ {
 		p.workerStatuses[i] = WorkerStats{ID: i, Status: "Idle"}
@@ -55,13 +71,29 @@ func (p *workerPool) Start(ctx context.Context) {
 }
 
 func (p *workerPool) Stop() {
-	log.Println("Stopping worker pool...")
-	close(p.quit)
+	p.life.Lock()
+	if !p.stopped {
+		p.stopped = true
+		close(p.quit)
+	}
+	p.life.Unlock()
 	p.wg.Wait()
 }
-
 func (p *workerPool) Submit(task ITask) {
-	p.taskChan <- task
+	if task == nil {
+		return
+	}
+	p.life.Lock()
+	ctx := p.ctx
+	p.life.Unlock()
+	if ctx == nil {
+		return
+	}
+	select {
+	case p.taskChan <- task:
+	case <-p.quit:
+	case <-ctx.Done():
+	}
 }
 
 func (p *workerPool) worker(ctx context.Context, id int) {
@@ -85,7 +117,7 @@ func (p *workerPool) executeTask(ctx context.Context, workerID int, task ITask) 
 	p.mu.Unlock()
 
 	log.Printf("Worker %d: Executing task %s", workerID, task.GetID())
-	err := task.Execute(ctx)
+	err := executeSafely(ctx, task)
 	if err != nil {
 		log.Printf("Worker %d: Task %s failed: %v", workerID, task.GetID(), err)
 		task.OnFailure(err)
@@ -104,4 +136,13 @@ func (p *workerPool) executeTask(ctx context.Context, workerID int, task ITask) 
 	if p.onComplete != nil {
 		p.onComplete(task)
 	}
+}
+
+func executeSafely(ctx context.Context, task ITask) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("task panic: %v", p)
+		}
+	}()
+	return task.Execute(ctx)
 }
