@@ -3,17 +3,24 @@ package scheduler
 import (
 	"context"
 	"log"
+	"sync"
 )
 
 type Scheduler struct {
-	queue      TaskQueue
-	pool       WorkerPool
-	dispatcher Dispatcher
-	ctx        context.Context
-	cancel     context.CancelFunc
+	mu               sync.Mutex
+	started, stopped bool
+	ids              map[string]bool
+	queue            TaskQueue
+	pool             WorkerPool
+	dispatcher       Dispatcher
+	ctx              context.Context
+	cancel           context.CancelFunc
 }
 
 func NewScheduler(workerCount int) *Scheduler {
+	if workerCount < 1 {
+		workerCount = 1
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	q := NewPriorityQueue()
 	p := NewWorkerPool(workerCount)
@@ -26,6 +33,7 @@ func NewScheduler(workerCount int) *Scheduler {
 
 	return &Scheduler{
 		queue:      q,
+		ids:        make(map[string]bool),
 		pool:       p,
 		dispatcher: d,
 		ctx:        ctx,
@@ -34,21 +42,42 @@ func NewScheduler(workerCount int) *Scheduler {
 }
 
 func (s *Scheduler) Start() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started || s.stopped {
+		return
+	}
+	s.started = true
 	s.pool.Start(s.ctx)
 	s.dispatcher.Start()
 	log.Println("Scheduler started (Modular)")
 }
 
 func (s *Scheduler) Stop() {
-	log.Println("Stopping scheduler...")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return
+	}
+	s.stopped = true
+	s.cancel()
 	s.dispatcher.Stop()
 	s.pool.Stop()
-	s.cancel()
-	log.Println("Scheduler stopped.")
 }
 
-func (s *Scheduler) Schedule(task ITask) {
+// Schedule transfers ownership of task to the scheduler. IDs must be unique.
+func (s *Scheduler) Schedule(task ITask) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped || task == nil || task.GetID() == "" || s.ids[task.GetID()] {
+		return false
+	}
+	if bt, ok := task.(*BaseTask); ok && (bt == nil || bt.Fn == nil || bt.Interval < 0 || bt.RetryLimit < 0) {
+		return false
+	}
+	s.ids[task.GetID()] = true
 	s.queue.Push(task)
+	return true
 }
 
 func (s *Scheduler) GetStats() SchedulerStats {

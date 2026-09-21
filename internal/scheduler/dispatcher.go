@@ -2,14 +2,18 @@ package scheduler
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
 type dispatcher struct {
-	queue  TaskQueue
-	pool   WorkerPool
-	ctx    context.Context
-	cancel context.CancelFunc
+	mu               sync.Mutex
+	started, stopped bool
+	wg               sync.WaitGroup
+	queue            TaskQueue
+	pool             WorkerPool
+	ctx              context.Context
+	cancel           context.CancelFunc
 }
 
 func NewDispatcher(queue TaskQueue, pool WorkerPool) Dispatcher {
@@ -23,11 +27,22 @@ func NewDispatcher(queue TaskQueue, pool WorkerPool) Dispatcher {
 }
 
 func (d *dispatcher) Start() {
-	go d.loop()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.started || d.stopped {
+		return
+	}
+	d.started = true
+	d.wg.Add(1)
+	go func() { defer d.wg.Done(); d.loop() }()
 }
 
 func (d *dispatcher) Stop() {
+	d.mu.Lock()
+	d.stopped = true
 	d.cancel()
+	d.mu.Unlock()
+	d.wg.Wait()
 }
 
 func (d *dispatcher) loop() {
@@ -46,6 +61,17 @@ func (d *dispatcher) loop() {
 
 func (d *dispatcher) dispatch() {
 	for {
+		if d.ctx.Err() != nil {
+			return
+		}
+		if q, ok := d.queue.(*PriorityQueue); ok {
+			task := q.PopReady(time.Now())
+			if task == nil {
+				return
+			}
+			d.pool.Submit(task)
+			continue
+		}
 		task := d.queue.Peak()
 		if task == nil {
 			return

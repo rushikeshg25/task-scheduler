@@ -3,6 +3,7 @@ package scheduler
 import (
 	"container/heap"
 	"sync"
+	"time"
 )
 
 type TaskHeap []ITask
@@ -74,4 +75,13 @@ func (pq *PriorityQueue) Len() int {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 	return pq.heap.Len()
+}
+
+func (pq *PriorityQueue) PopReady(now time.Time) ITask {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	if len(pq.heap) == 0 || pq.heap[0].GetScheduledAt().After(now) {
+		return nil
+	}
+	return heap.Pop(&pq.heap).(ITask)
 }
